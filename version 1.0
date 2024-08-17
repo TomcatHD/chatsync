@@ -1,0 +1,101 @@
+package com.yourpackage;
+
+import org.bukkit.Bukkit;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
+import org.bukkit.plugin.java.JavaPlugin;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPubSub;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
+
+import java.util.UUID;
+
+public class chatsync extends JavaPlugin implements Listener {
+
+    private Jedis jedis;
+    private final String redisChannel = "minecraftChat";
+    private UUID lastMessageId = null;
+
+    @Override
+    public void onEnable() {
+        saveDefaultConfig();
+
+        String redisHost = getConfig().getString("redis.host", "localhost");
+        int redisPort = getConfig().getInt("redis.port", 6379);
+        String redisPassword = getConfig().getString("redis.password", "");
+
+        jedis = new Jedis(redisHost, redisPort);
+        if (!redisPassword.isEmpty()) {
+            jedis.auth(redisPassword);
+        }
+
+        getServer().getPluginManager().registerEvents(this, this);
+
+        // Subscribe to the Redis channel in a separate thread
+        new Thread(() -> {
+            try (Jedis subscriberJedis = new Jedis(redisHost, redisPort)) {
+                if (!redisPassword.isEmpty()) {
+                    subscriberJedis.auth(redisPassword);
+                }
+
+                subscriberJedis.subscribe(new JedisPubSub() {
+                    @Override
+                    public void onMessage(String channel, String message) {
+                        if (channel.equals(redisChannel)) {
+                            // Avoid rebroadcasting messages that were just sent by this server
+                            if (!message.startsWith(lastMessageId != null ? lastMessageId.toString() : "")) {
+                                String rawMessage = message.substring(36);  // Remove the UUID
+                                Component componentMessage = LegacyComponentSerializer.legacySection().deserialize(rawMessage);
+
+                                // Log the message to the server console
+                                getLogger().info(LegacyComponentSerializer.legacySection().serialize(componentMessage));
+
+                                Bukkit.getOnlinePlayers().forEach(player -> player.sendMessage(componentMessage));
+                            }
+                        }
+                    }
+                }, redisChannel);
+            }
+        }).start();
+
+        getLogger().info("ChatSyncPlugin has been enabled!");
+    }
+
+    @Override
+    public void onDisable() {
+        if (jedis != null) {
+            jedis.close();
+        }
+        getLogger().info("ChatSyncPlugin has been disabled!");
+    }
+
+    @SuppressWarnings("deprecation")
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onPlayerChat(AsyncPlayerChatEvent event) {
+        // Generate a unique ID for this message
+        lastMessageId = UUID.randomUUID();
+
+        // Get the formatted message with color codes
+        String playerName = LegacyComponentSerializer.legacySection().serialize(event.getPlayer().displayName());
+        String formattedMessage = String.format(event.getFormat(), playerName, event.getMessage());
+
+        // Prefix the message with the unique ID to track it
+        String messageWithId = lastMessageId.toString() + formattedMessage;
+
+        // Publish the message to the Redis channel
+        jedis.publish(redisChannel, messageWithId);
+
+        // Cancel the original event to prevent double broadcasting
+        event.setCancelled(true);
+
+        // Send the message to all players locally
+        Component componentMessage = LegacyComponentSerializer.legacySection().deserialize(formattedMessage);
+        Bukkit.getOnlinePlayers().forEach(player -> player.sendMessage(componentMessage));
+
+        // Log the message to the server console
+        getLogger().info(formattedMessage);
+    }
+}
